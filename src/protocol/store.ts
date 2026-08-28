@@ -608,3 +608,118 @@ export class TowerStore {
       '## Suggested Fix / Action',
       input.suggestedFix.trim(),
       '',
+      '## Why Not Fixed Directly',
+      mission === undefined
+        ? 'This finding is outside the reporting agent’s assignment. Assigning to the control tower for routing.'
+        : `This finding is outside the scope of mission ${mission.id} (${mission.scope.join(', ')}). Fixing it directly would violate scope isolation. Assigning to the control tower for routing.`,
+      '',
+      '---',
+      '',
+      `*Filed by tower agent ${callerName} via \`${FINDINGS_DIR}/\`*`,
+      '',
+    ];
+    const baseName = findingFileName({
+      agent: callerName,
+      type: input.type,
+      slug: input.title,
+    });
+    const rel = await this.writeUnique(join(FINDINGS_DIR, baseName), lines.join('\n'));
+    await this.appendLog(callerName, 'finding.file', { type: input.type, slug: slugify(input.title) }, rel);
+    return rel;
+  }
+
+  async submitReview(callerName: string, input: TowerReviewInput): Promise<string> {
+    const state = await this.load();
+    if (callerName !== TOWER_NAME) {
+      const caller = this.findAgent(state, callerName);
+      if (caller?.kind !== 'reviewer' || caller.reviewTarget !== input.target) {
+        throw new TowerProtocolError(
+          `agent "${callerName}" is not an assigned reviewer for "${input.target}"`,
+        );
+      }
+    }
+    if (!/^(clean|p[12]-\d+items)$/.test(input.status)) {
+      throw new TowerProtocolError(
+        `review status must be clean | p1-Nitems | p2-Nitems, got "${input.status}"`,
+      );
+    }
+    if (!['merge', 'fix-then-merge', 'hold'].includes(input.merge)) {
+      throw new TowerProtocolError(
+        `review merge verdict must be merge | fix-then-merge | hold, got "${input.merge}"`,
+      );
+    }
+
+    const existing = await this.reviewsFor(input.target);
+    const myRounds = existing.filter((r) => r.reviewer === callerName).length;
+    const round = myRounds + 1;
+    const reviewedCommit = await branchTip(this.repoRoot, input.target);
+
+    const frontmatter = renderFrontmatter({
+      date: dateDash(),
+      reviewer: callerName,
+      target: input.target,
+      round: String(round),
+      status: input.status,
+      merge: input.merge,
+      reviewed_commit: reviewedCommit,
+    });
+    const checks = (input.checks ?? []).map((c) => `- [x] ${c}`).join('\n');
+    const content = [
+      frontmatter,
+      '',
+      '## Findings',
+      '',
+      input.findings.trim(),
+      '',
+      '## Checks',
+      checks.length > 0 ? checks : '- [x] (reviewer reported no formal checks)',
+      '',
+      '## Decision',
+      input.decision.trim(),
+      '',
+    ].join('\n');
+
+    const rel = await this.writeUnique(
+      join(REVIEWS_DIR, reviewFileName({ target: input.target, reviewer: callerName, round })),
+      content,
+    );
+    await this.appendLog(
+      callerName,
+      'review.write',
+      { target: input.target, round, verdict: input.status, reviewed: reviewedCommit.slice(0, 7) },
+      rel,
+    );
+    return rel;
+  }
+
+  async reviewsFor(target: string): Promise<readonly TowerReviewInfo[]> {
+    let files: string[];
+    try {
+      files = await readdir(this.abs(REVIEWS_DIR));
+    } catch {
+      return [];
+    }
+    const prefix = `review-${targetSlug(target)}-`;
+    const reviews: TowerReviewInfo[] = [];
+    for (const file of files.filter((f) => f.startsWith(prefix) && f.endsWith('.md'))) {
+      const rel = join(REVIEWS_DIR, file);
+      let text: string;
+      try {
+        text = await readFile(this.abs(rel), 'utf8');
+      } catch {
+        continue;
+      }
+      const { fields } = parseFrontmatter(text);
+      const round = Number.parseInt(fields['round'] ?? '', 10);
+      if (Number.isNaN(round)) continue;
+      reviews.push({
+        reviewer: fields['reviewer'] ?? 'unknown',
+        target: fields['target'] ?? target,
+        round,
+        status: fields['status'] ?? '',
+        merge: fields['merge'] ?? '',
+        reviewedCommit: fields['reviewed_commit'] ?? '',
+        date: fields['date'] ?? '',
+        file: rel,
+      });
+    }
