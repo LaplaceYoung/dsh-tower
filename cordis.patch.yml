@@ -6,3 +6,4 @@
       config:
         experimental: false
         inflightCap: 8
+        announceToAgent: true
