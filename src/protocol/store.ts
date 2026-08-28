@@ -490,3 +490,121 @@ export class TowerStore {
       patch.scope === undefined;
     if (!taskTickOnly && options.silent !== true) {
       await this.appendLog(callerName, 'mission.update', {
+        id,
+        status: patch.status,
+        note: patch.note !== undefined ? 'added' : undefined,
+        blocker: patch.blocker !== undefined ? 'added' : undefined,
+        owner: patch.owner,
+        scope: patch.scope?.join(','),
+      });
+    }
+    return mission;
+  }
+
+  async send(callerName: string, input: TowerSendInput): Promise<string> {
+    const state = await this.load();
+    const to = input.to.trim();
+    if (
+      to !== TOWER_NAME &&
+      to !== BROADCAST_NAME &&
+      this.findAgent(state, to) === undefined
+    ) {
+      const known = [TOWER_NAME, BROADCAST_NAME, ...state.roster.agents.map((a) => a.name)];
+      throw new TowerProtocolError(
+        `unknown recipient "${to}" — address a roster agent, ${TOWER_NAME}, or ${BROADCAST_NAME} (known: ${known.join(', ')})`,
+      );
+    }
+    if (to === callerName) {
+      throw new TowerProtocolError('cannot send an inbox message to yourself');
+    }
+
+    const frontmatter = renderFrontmatter({
+      type: 'inbox',
+      message_id: randomUUID(),
+      from: callerName,
+      to,
+      subject: input.subject,
+      sent_at: new Date().toISOString(),
+      ...(input.scope !== undefined ? { scope: input.scope } : {}),
+      ...(input.action !== undefined ? { action: input.action } : {}),
+      ...(input.consentRef !== undefined ? { consent_ref: input.consentRef } : {}),
+    });
+    const content = `${frontmatter}\n\n${input.body.trim()}\n`;
+    const baseName = inboxFileName({ from: callerName, to, subject: input.subject });
+    const rel = await this.writeUnique(join(INBOX_DIR, baseName), content);
+    await this.appendLog(callerName, 'inbox.send', { to, subject: slugify(input.subject) }, rel);
+    return rel;
+  }
+
+  async readInbox(callerName: string, limit: number): Promise<readonly TowerInboxItem[]> {
+    let files: string[];
+    try {
+      files = await readdir(this.abs(INBOX_DIR));
+    } catch {
+      return [];
+    }
+    const items: TowerInboxItem[] = [];
+    for (const file of files.filter((f) => f.endsWith('.md'))) {
+      const rel = join(INBOX_DIR, file);
+      let text: string;
+      try {
+        text = await readFile(this.abs(rel), 'utf8');
+      } catch {
+        continue;
+      }
+      const { fields, body } = parseFrontmatter(text);
+      if (fields['type'] !== 'inbox') continue;
+      const to = fields['to'] ?? '';
+      if (callerName !== TOWER_NAME && to !== callerName && to !== BROADCAST_NAME) continue;
+      items.push({
+        file: rel,
+        from: fields['from'] ?? 'unknown',
+        to,
+        subject: fields['subject'] ?? '',
+        sentAt: fields['sent_at'] ?? '',
+        scope: fields['scope'],
+        action: fields['action'],
+        consentRef: fields['consent_ref'],
+        body,
+      });
+    }
+    items.sort((a, b) => b.sentAt.localeCompare(a.sentAt));
+    return items.slice(0, Math.max(1, limit));
+  }
+
+  async fileFinding(callerName: string, input: TowerFindingInput): Promise<string> {
+    if (!FINDING_TYPES.includes(input.type)) {
+      throw new TowerProtocolError(
+        `finding type must be one of ${FINDING_TYPES.join(' | ')}`,
+      );
+    }
+    const state = await this.load();
+    const caller = this.findAgent(state, callerName);
+    const mission =
+      caller?.missionId !== undefined
+        ? state.missions.find((m) => m.id === caller.missionId)
+        : undefined;
+
+    const lines = [
+      `# Finding: ${input.title}`,
+      '',
+      `**Date**: ${dateDash().replaceAll('-', '')}`,
+      `**Agent**: ${callerName}`,
+      `**Type**: ${input.type}`,
+      `**Severity**: ${input.severity ?? 'medium'}`,
+      `**Mission**: ${mission === undefined ? '(none)' : `${mission.id} — ${mission.title}`}`,
+      '',
+      '---',
+      '',
+      '## Summary',
+      input.summary.trim(),
+      '',
+      '## Location',
+      (input.location ?? '(not specified)').trim(),
+      '',
+      '## Details',
+      input.details.trim(),
+      '',
+      '## Suggested Fix / Action',
+      input.suggestedFix.trim(),
+      '',
