@@ -723,3 +723,99 @@ export class TowerStore {
         file: rel,
       });
     }
+    reviews.sort((a, b) => a.round - b.round);
+    return reviews;
+  }
+
+  async latestReview(target: string): Promise<TowerReviewInfo | undefined> {
+    const reviews = await this.reviewsFor(target);
+    return reviews.at(-1);
+  }
+
+  async merge(branch: string): Promise<{
+    readonly mergeCommit: string;
+    readonly conflictsWith: ReadonlyArray<{ readonly branch: string; readonly files: readonly string[] }>;
+    readonly noop?: boolean;
+  }> {
+    const state = await this.load();
+    const mission = state.missions.find((m) => m.branch === branch);
+    if (mission === undefined) {
+      throw new TowerProtocolError(`no tower mission owns branch "${branch}"`);
+    }
+    const block = async (reason: string, message: string): Promise<TowerProtocolError> => {
+      await this.appendLog(TOWER_NAME, 'merge.blocked', { branch, reason });
+      return new TowerProtocolError(message);
+    };
+
+    const unmergedDeps = mission.deps.filter((dep) => {
+      const depMission = state.missions.find((m) => m.id === dep);
+      return depMission !== undefined && isOpenMission(depMission);
+    });
+    if (unmergedDeps.length > 0) {
+      throw await block(
+        'deps-unmerged',
+        `merge blocked: dependencies not merged yet (${unmergedDeps.join(', ')}) — merge in Dependency Flow order`,
+      );
+    }
+
+    if (mission.kind === 'survey') {
+      const changed = await diffNameOnly(this.repoRoot, state.base, branch);
+      if (changed.length > 0) {
+        throw await block(
+          'read-only-survey',
+          `merge blocked: survey mission ${mission.id} is read-only but ${branch} has ${String(changed.length)} changed file(s): ${changed.slice(0, 5).join(', ')} — investigate the worker; if the changes are worth keeping, move them onto a build mission's branch`,
+        );
+      }
+      mission.status = 'merged';
+      await this.save(state);
+      await this.renderMissionsIndex(state);
+      await this.renderMissionFile(mission);
+      const tip = await branchTip(this.repoRoot, state.base);
+      await this.appendLog(TOWER_NAME, 'merge.noop', { branch, kind: 'survey' });
+      return { mergeCommit: tip, conflictsWith: [], noop: true };
+    }
+
+    const review = await this.latestReview(branch);
+    if (review === undefined) {
+      throw await block(
+        'no-review',
+        `merge blocked: ${branch} has no review — assign a reviewer first`,
+      );
+    }
+    if (review.status !== 'clean') {
+      throw await block(
+        'not-clean',
+        `merge blocked: latest review (round ${review.round} by ${review.reviewer}) is "${review.status}" — a clean round is required`,
+      );
+    }
+    const tip = await branchTip(this.repoRoot, branch);
+    if (review.reviewedCommit !== tip) {
+      throw await block(
+        'tip-moved',
+        `merge blocked: ${branch} moved since the clean review (reviewed ${review.reviewedCommit.slice(0, 7)}, tip ${tip.slice(0, 7)}) — re-review required`,
+      );
+    }
+
+    const changed = await diffNameOnly(this.repoRoot, state.base, branch);
+    const outOfScope = changed.filter(
+      (file) => !mission.scope.some((glob) => picomatch.isMatch(file, glob)),
+    );
+    if (outOfScope.length > 0) {
+      throw await block(
+        'out-of-scope',
+        `merge blocked: ${branch} changed files outside mission ${mission.id} scope (${mission.scope.join(', ')}): ${outOfScope.join(', ')} — the tower must widen the mission scope (TowerMission scope patch) or revert those changes`,
+      );
+    }
+
+    let checkedOut: string;
+    try {
+      checkedOut = await currentBranch(this.repoRoot);
+    } catch {
+      throw await block(
+        'base-mismatch',
+        `merge blocked: the main checkout is in a detached HEAD state — check out the recorded base branch "${state.base}" before merging; nothing was merged`,
+      );
+    }
+    if (checkedOut !== state.base) {
+      throw await block(
+        'base-mismatch',
