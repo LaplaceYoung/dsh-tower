@@ -267,3 +267,118 @@ export class TowerStore {
   }
 
   async appendLog(
+    actor: string,
+    action: string,
+    details: Readonly<Record<string, string | number | undefined>> = {},
+    ref?: string,
+  ): Promise<void> {
+    const kv = Object.entries(details)
+      .filter((entry): entry is [string, string | number] => entry[1] !== undefined)
+      .map(([key, value]) => `${key}=${value}`)
+      .join(' ');
+    const parts = [new Date().toISOString(), actor, action];
+    if (kv.length > 0) parts.push(kv);
+    if (ref !== undefined) parts.push(`ref=${ref}`);
+    await appendFile(this.abs(ACTIVITY_LOG), `${parts.join(' ')}\n`, 'utf8');
+  }
+
+  async recentLog(lines: number): Promise<readonly string[]> {
+    let content = '';
+    try {
+      content = await readFile(this.abs(ACTIVITY_LOG), 'utf8');
+    } catch {
+      return [];
+    }
+    const all = content.split('\n').filter((line) => line.trim().length > 0);
+    return all.slice(-lines);
+  }
+
+  resolveCallerName(state: TowerState, agentId: string): string {
+    if (agentId === 'main') return TOWER_NAME;
+    const entry = state.roster.agents.find((agent) => agent.agentId === agentId);
+    if (entry === undefined) {
+      throw new TowerProtocolError(
+        `agent "${agentId}" is not a tower participant — only spawned workers/reviewers and the tower can use tower tools`,
+      );
+    }
+    return entry.name;
+  }
+
+  findAgent(state: TowerState, name: string): TowerRosterEntry | undefined {
+    return state.roster.agents.find((agent) => agent.name === name);
+  }
+
+  findByName(state: TowerState, name: string): TowerRosterEntry | undefined {
+    return this.findAgent(state, name);
+  }
+
+  async registerAgent(entry: TowerRosterEntry): Promise<void> {
+    const state = await this.load();
+    if (this.findAgent(state, entry.name) !== undefined) {
+      throw new TowerProtocolError(`tower agent name "${entry.name}" is already registered`);
+    }
+    state.roster.agents.push(entry);
+    await this.save(state);
+  }
+
+  async plan(input: readonly TowerPlanInput[]): Promise<readonly TowerMission[]> {
+    if (input.length === 0) {
+      throw new TowerProtocolError('TowerPlan needs at least one mission');
+    }
+    const state = await this.load();
+    const startIndex = state.missions.length;
+
+    const missions: TowerMission[] = input.map((item, index) => {
+      const n = startIndex + index + 1;
+      const slug = slugify(item.title, 40);
+      return {
+        id: `M${n}`,
+        title: item.title,
+        slug,
+        kind: item.kind ?? 'build',
+        scope: [...item.scope],
+        branch: `feat/${slug}`,
+        worktree: `wt-${n}`,
+        deps: item.deps ?? [],
+        status: 'planned',
+        tasks: (item.tasks ?? []).map((text) => ({ text, done: false })),
+        notes: [],
+        blockers: [],
+      };
+    });
+
+    const knownIds = new Set([...state.missions.map((m) => m.id), ...missions.map((m) => m.id)]);
+    for (const mission of missions) {
+      for (const dep of mission.deps) {
+        if (!knownIds.has(dep)) {
+          throw new TowerProtocolError(`mission ${mission.id} depends on unknown mission "${dep}"`);
+        }
+      }
+    }
+    this.assertScopesDisjoint([
+      ...state.missions.filter(isOpenMission),
+      ...missions,
+    ]);
+
+    state.missions.push(...missions);
+    await this.save(state);
+    await this.renderMissionsIndex(state);
+    for (const mission of missions) {
+      await this.renderMissionFile(mission);
+    }
+    await this.appendLog(
+      TOWER_NAME,
+      'plan',
+      { missions: missions.map((m) => m.id).join(',') },
+      MISSIONS_INDEX,
+    );
+    return missions;
+  }
+
+  private assertScopesDisjoint(missions: readonly TowerMission[]): void {
+    const scopes: Array<{ readonly id: string; readonly raw: string; readonly stem: string }> = [];
+    for (const mission of missions) {
+      if (mission.kind === 'survey') continue;
+      for (const raw of mission.scope) {
+        const stem = raw.replace(/\/\*\*?$/, '').replace(/\*$/, '').replace(/\/+$/, '');
+        if (stem.length === 0) {
