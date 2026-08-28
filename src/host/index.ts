@@ -2,22 +2,32 @@ import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-commands';
 import type {} from '@deepseek-ai/dsh-subagent';
 import type {} from '@deepseek-ai/dsh-tools';
+import type {} from '@deepseek-ai/dsh-system-prompt';
 import Schema from 'schemastery';
 
 import { registerTowerCommand } from './command.js';
 import { isTowerEnabled } from './flag.js';
-import { towerWriteGuard, towerWritePreExecute } from './guard.js';
+import { towerWriteGuard } from './guard.js';
+import { installNativeSeams } from './native.js';
 import { TowerRateLimit } from './rateLimit.js';
 import { registerTowerTools } from './tools/index.js';
 
 export const name = 'dsh-tower';
-export const inject = ['tools', 'commands', 'subagents'] as const;
+/** tools/commands/subagents required; systemPrompt optional via soft inject. */
+export const inject = {
+  tools: true,
+  commands: true,
+  subagents: true,
+  systemPrompt: { required: false },
+};
 
 export interface Config {
   /** Enable Tower tools (also via DSH_EXPERIMENTAL_TOWER=1). Default false. */
   experimental?: boolean;
   /** Inflight spawn cap (default 8). */
   inflightCap?: number;
+  /** Announce Tower in the system prompt when enabled (default true). */
+  announceToAgent?: boolean;
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -27,6 +37,9 @@ export const Config: Schema<Config> = Schema.object({
   inflightCap: Schema.number()
     .default(8)
     .description('Max concurrent tower worker/reviewer spawns.'),
+  announceToAgent: Schema.boolean()
+    .default(true)
+    .description('Register a systemPrompt section announcing Tower when experimental is on.'),
 });
 
 export function apply(ctx: Context, config: Config = {}): void {
@@ -36,24 +49,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   registerTowerTools(ctx, rateLimit);
   registerTowerCommand(ctx);
   ctx.tools.guard(towerWriteGuard);
-
-  // Prefer async pre-execute when the waterfall is available.
-  try {
-    const anyCtx = ctx as Context & {
-      on?: (
-        event: string,
-        listener: (...args: never[]) => unknown,
-      ) => void;
-    };
-    anyCtx.on?.('tools/pre-execute' as never, (async (
-      execution: Parameters<typeof towerWritePreExecute>[0],
-      next: () => Promise<{ kind: string; reason?: string }>,
-    ) => {
-      const deny = await towerWritePreExecute(execution);
-      if (deny !== undefined) return { kind: 'deny', reason: deny.reason };
-      return next();
-    }) as never);
-  } catch {
-    // Sync guard remains as fallback.
-  }
+  installNativeSeams(ctx, rateLimit, {
+    announceToAgent: config.announceToAgent !== false,
+  });
 }

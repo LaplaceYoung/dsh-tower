@@ -1,8 +1,10 @@
 # dsh-tower
 
-DeepSeek Harness community plugin that ports **Kimi Code Tower** onto DSH plugin seams (`ctx.tools` / `ctx.commands` / `ctx.subagents` / tool waterfall).
+DeepSeek Harness community plugin that ports **Kimi Code Tower** onto DSH plugin seams (`ctx.tools` / `ctx.commands` / `ctx.subagents` / `tools/pre-execute` / `systemPrompt`).
 
 > Tower = main agent as control tower; workers build in **isolated git worktrees**; merge only after **clean review** and protocol hard gates.
+
+中文：[README.zh.md](./README.zh.md)
 
 ## Pins
 
@@ -18,13 +20,22 @@ Published npm peers track the closest public cut (`0.1.1-rc.2`); runtime compati
 
 ## Install
 
+### From a DSH source checkout (recommended)
+
 ```bash
+git clone https://github.com/deepseek-ai/deepseek-harness.git
+cd deepseek-harness
+git checkout dsh-v0.1.2-alpha.1
+pnpm install && pnpm run build
+
+pnpm dsh plugin --profile web add github:LaplaceYoung/dsh-tower
+# or: pnpm dsh plugin --profile web add /absolute/path/to/dsh-tower
+
 export DSH_EXPERIMENTAL_TOWER=1
-dsh plugin --profile web add github:LaplaceYoung/dsh-tower
-dsh web
+pnpm dsh web --no-open
 ```
 
-Or set plugin config `experimental: true`. **Default is off** — installing the plugin does not put `Tower*` tools into the default toolset.
+Or set plugin config `experimental: true` in the profile `cordis.patch.yml`. **Default is off.**
 
 ```text
 /tower on
@@ -52,13 +63,27 @@ Or set plugin config `experimental: true`. **Default is off** — installing the
 7. Dirty base: **refused** on init / worktree create (does not copy Kimi #3346 silent HEAD behaviour).
 8. Reviewers are read-only (`write` / `edit` / `str_replace_editor` denied).
 
+## DSH native seams used
+
+| Seam | Use |
+|---|---|
+| `ctx.tools.register` + `defineTool` | 11 `Tower*` tools |
+| `ctx.tools.guard` | Sync write veto for workers |
+| `ctx.on('tools/pre-execute')` | Async authoritative out-of-worktree deny |
+| `ctx.commands.register` | `/tower`; steers the full operating manual |
+| `ctx.subagents.startContinuable` | Workers/reviewers (never `start()`) |
+| `ctx.on('subagent/end')` | Release inflight spawn slots |
+| `ctx.systemPrompt.section` | Optional model announcement (`announceToAgent`) |
+
+No custom DSH session vocabulary events — progress via tool returns and `.dsh-tower/comms/log/activity.log`.
+
 ## Develop
 
 ```bash
 npm install
-npm test          # protocol + host unit tests — no full DSH install required
+npm test
 npm run build
-npm run smoke:dsh-pin   # shallow-clone pinned DSH tag
+npm run smoke:dsh-pin
 ```
 
 ## Sources
@@ -66,19 +91,16 @@ npm run smoke:dsh-pin   # shallow-clone pinned DSH tag
 - Tower root: https://github.com/MoonshotAI/kimi-code/tree/master/packages/agent-core-v2/src/features/tower
 - `TowerStore`: https://github.com/MoonshotAI/kimi-code/blob/master/packages/agent-core-v2/src/features/tower/protocol/store.ts
 - Mode reminder: https://github.com/MoonshotAI/kimi-code/blob/master/packages/agent-core-v2/src/features/tower/injection/tower-mode-full-reminder.md
-- Spawn: https://github.com/MoonshotAI/kimi-code/blob/master/packages/agent-core-v2/src/features/tower/tools/spawn/spawnTool.ts
-- Write guard: https://github.com/MoonshotAI/kimi-code/blob/master/packages/agent-core-v2/src/features/tower/towerService.ts
 - DSH tools: https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.1.2-alpha.1/docs/user/develop/basic/tool.md
 - Continuable subagents: https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.1.2-alpha.1/packages/subagent/subagent/src/continuation.ts
-- Plugin packaging reference (not semantics): https://github.com/hongyue0721/dsh-kimicode-swarm
 
 ## Layout
 
 ```
 src/protocol/   # zero Cordis — portable TowerStore
-src/host/       # DSH apply(), 11 tools, /tower, spawn, write guard
-tests/protocol/ # §6.1 matrix
-tests/host/     # flag, spawn rollback, write veto
+src/host/       # DSH apply(), tools, /tower, spawn, write guard, native seams
+tests/protocol/
+tests/host/
 ```
 
 Does not vendor or fork `deepseek-harness`.
