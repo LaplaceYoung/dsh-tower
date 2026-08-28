@@ -173,30 +173,8 @@ export async function spawnTowerAgent(input: {
     });
 
     await refreshRosterCache(store.repoRoot);
+    rateLimit.holdChild(agentId);
     slotHeld = false;
-
-    // Release when child settles if the runtime exposes end hooks; otherwise
-    // the cap is approximate for P1 (teardown / process end clears it).
-    void Promise.resolve()
-      .then(async () => {
-        // Soft release after a long idle is not ideal; prefer subagent end event when available.
-      })
-      .finally(() => {
-        /* slot released only on failure path above; success holds until explicit release */
-      });
-
-    // Keep slot until teardown of this process's accounting — attach listener if present.
-    try {
-      const anyCtx = ctx as Context & {
-        on?: (event: string, listener: (...args: unknown[]) => void) => void;
-      };
-      anyCtx.on?.('subagent/end', (...args: unknown[]) => {
-        const payload = args[0] as { childId?: string } | undefined;
-        if (payload?.childId === agentId) rateLimit.release();
-      });
-    } catch {
-      // ignore
-    }
 
     return [
       `name: ${args.name}`,
