@@ -37,15 +37,23 @@ Evidence gathered in this agent run (2026-08-28).
 - [x] Inflight rate-limit cap (default 8)
 - [x] No custom DSH session vocabulary events (activity.log + tool returns only)
 - [x] Dual-mission scripted merge: two disjoint scopes → clean reviews → both land on main → teardown removes worktrees
+- [x] Native seams wired: `systemPrompt.section`, `tools/pre-execute`, `subagent/end`
+- [x] `defineTool` nested object schemas include `additionalProperties` (DSH web requirement)
 
 ## Packaging
 
 - [x] Independent npm plugin (`name: dsh-tower`, `main` set)
 - [x] README cites Kimi 0.39.1 + DSH 0.1.2-alpha.1 source links
+- [x] `README.zh.md` Chinese install / seams guide added
 - [x] Does not fork/vendor `deepseek-harness`
 - [x] `cordis.patch.yml` mounts plugin with `experimental: false`
 
 ## Notes
 
-- Full live `dsh web` dual-mission with real LLM workers was not run in this environment (no DSH monorepo install). Protocol merge path + host spawn/guard unit tests cover the gates and seams.
+- Verified against locally built `dsh-v0.1.2-alpha.1` web on `:3080`.
+- Plugin loads via `dsh plugin --profile web add` (path or `github:LaplaceYoung/dsh-tower`).
+- `defineTool` schema needs `additionalProperties` on nested objects for DSH web validation.
+- Native seams: `systemPrompt`, `tools/pre-execute`, `subagent/end`.
+- `README.zh.md` added.
+- Full live dual-mission with real LLM workers was not run end-to-end; protocol merge path + host spawn/guard/native unit tests cover the gates and seams.
 - Published npm peers are `0.1.1-rc.2` (closest public cut); runtime pin remains `dsh-v0.1.2-alpha.1`.
