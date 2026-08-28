@@ -85,6 +85,7 @@ export function registerTowerTools(ctx: Context, rateLimit: TowerRateLimit): voi
           description: 'Missions to plan',
           items: {
             type: 'object',
+            additionalProperties: false,
             properties: {
               title: { type: 'string', required: true },
               scope: {
