@@ -1,530 +1,411 @@
-import { randomUUID } from 'node:crypto';
-import { appendFile, mkdir, open, readFile, readdir, rename, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-
-import picomatch from 'picomatch';
-
-import { parseFrontmatter, renderFrontmatter } from './frontmatter.js';
-import {
-  branchExists,
-  branchTip,
-  currentBranch,
-  diffNameOnly,
-  hasAnyCommit,
-  isInsideRepo,
-  isWorktreeDirty,
-  mergeNoFf,
-  tryGit,
-  worktreeAdd,
-  worktreeRemove,
-} from './git.js';
-import {
-  ACTIVITY_LOG,
-  BROADCAST_NAME,
-  FINDINGS_DIR,
-  INBOX_DIR,
-  LOG_DIR,
-  MISSIONS_DIR,
-  MISSIONS_INDEX,
-  REVIEWS_DIR,
-  STATE_FILE,
-  TOWER_NAME,
-  WORKTREES_DIR,
-  dateDash,
-  findingFileName,
-  inboxFileName,
-  missionFileName,
-  reviewFileName,
-  slugify,
-  targetSlug,
-} from './paths.js';
+import { createHash, randomUUID } from 'node:crypto'
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import path from 'node:path'
 import type {
-  TowerFindingSeverity,
-  TowerFindingType,
-  TowerInboxItem,
-  TowerMission,
-  TowerMissionKind,
-  TowerMissionStatus,
-  TowerReviewInfo,
-  TowerRosterEntry,
-  TowerState,
-} from './types.js';
+  ArtifactRef,
+  ConsentRef,
+  Message,
+  Mission,
+  MissionStatus,
+  ProtocolConfig,
+  ProtocolEvent,
+  ProtocolStore,
+  Role,
+  Status,
+} from './types.js'
 
-export class TowerProtocolError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'TowerProtocolError';
+const SCHEMA_VERSION = 1 as const
+
+interface EnvelopeV1 {
+  schemaVersion: typeof SCHEMA_VERSION
+  missions: Record<string, Mission>
+  messages: Record<string, Message[]>
+  events: ProtocolEvent[]
+}
+
+function nowIso(): string {
+  return new Date().toISOString()
+}
+
+function cloneDeep<T>(value: T): T {
+  return structuredClone(value)
+}
+
+function assertNonEmpty(value: string, field: string): void {
+  if (!value.trim()) throw new Error(`${field} must be non-empty`)
+}
+
+function assertRole(role: Role): void {
+  if (role !== 'A' && role !== 'B') throw new Error(`invalid role: ${role}`)
+}
+
+function assertStatus(status: Status): void {
+  const ok: Status[] = ['proposed', 'accepted', 'rejected', 'expired', 'revoked']
+  if (!ok.includes(status)) throw new Error(`invalid status: ${status}`)
+}
+
+function assertMissionStatus(status: MissionStatus): void {
+  const ok: MissionStatus[] = ['open', 'blocked', 'done', 'cancelled']
+  if (!ok.includes(status)) throw new Error(`invalid mission_status: ${status}`)
+}
+
+function assertArtifact(a: ArtifactRef): void {
+  assertNonEmpty(a.uri, 'artifact.uri')
+  assertNonEmpty(a.media_type, 'artifact.media_type')
+  assertNonEmpty(a.sha256, 'artifact.sha256')
+  if (!/^[a-f0-9]{64}$/i.test(a.sha256)) throw new Error('artifact.sha256 must be 64 hex chars')
+  if (!Number.isInteger(a.bytes) || a.bytes < 0) throw new Error('artifact.bytes must be >= 0')
+}
+
+function assertConsent(c: ConsentRef): void {
+  assertNonEmpty(c.id, 'consent.id')
+  assertStatus(c.status)
+  assertNonEmpty(c.scope, 'consent.scope')
+  assertNonEmpty(c.granted_by, 'consent.granted_by')
+  assertNonEmpty(c.granted_at, 'consent.granted_at')
+  if (Number.isNaN(Date.parse(c.granted_at))) throw new Error('consent.granted_at must be ISO datetime')
+  if (c.expires_at !== undefined) {
+    if (Number.isNaN(Date.parse(c.expires_at))) throw new Error('consent.expires_at must be ISO datetime')
   }
 }
 
-export interface TowerInitResult {
-  readonly base: string;
-  readonly created: boolean;
-  readonly retiredAgents: readonly string[];
-  readonly checkout: string;
-  readonly ignoredBase?: string;
-  readonly openMissions: readonly string[];
+function emptyEnvelope(): EnvelopeV1 {
+  return { schemaVersion: SCHEMA_VERSION, missions: {}, messages: {}, events: [] }
 }
 
-export interface TowerPlanInput {
-  readonly title: string;
-  readonly scope: readonly string[];
-  readonly tasks?: readonly string[];
-  readonly deps?: readonly string[];
-  readonly kind?: TowerMissionKind;
+async function atomicWriteJson(filePath: string, data: unknown): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true })
+  const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`
+  await writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, 'utf8')
+  await rename(tmp, filePath)
 }
 
-export interface TowerSendInput {
-  readonly to: string;
-  readonly subject: string;
-  readonly body: string;
-  readonly scope?: string;
-  readonly action?: string;
-  readonly consentRef?: string;
-}
+export class FileProtocolStore implements ProtocolStore {
+  private readonly root: string
+  private readonly filePath: string
+  private readonly defaultArtifactsRoot: string
+  private envelope: EnvelopeV1 = emptyEnvelope()
+  private loaded = false
+  private writeChain: Promise<void> = Promise.resolve()
 
-export interface TowerFindingInput {
-  readonly type: TowerFindingType;
-  readonly title: string;
-  readonly severity?: TowerFindingSeverity;
-  readonly summary: string;
-  readonly location?: string;
-  readonly details: string;
-  readonly suggestedFix: string;
-}
+  constructor(config: ProtocolConfig) {
+    this.root = path.resolve(config.rootDir)
+    this.filePath = path.join(this.root, 'protocol.json')
+    this.defaultArtifactsRoot = path.resolve(config.artifactsDir ?? path.join(this.root, 'artifacts'))
+  }
 
-export interface TowerReviewInput {
-  readonly target: string;
-  readonly status: string;
-  readonly merge: string;
-  readonly findings: string;
-  readonly checks?: readonly string[];
-  readonly decision: string;
-}
-
-export interface TowerMissionPatch {
-  readonly status?: TowerMissionStatus;
-  readonly note?: string;
-  readonly blocker?: string;
-  readonly clearBlockers?: boolean;
-  readonly taskDone?: string;
-  readonly owner?: string;
-  readonly scope?: readonly string[];
-}
-
-const FINDING_TYPES: readonly TowerFindingType[] = ['bug', 'improve', 'vuln', 'idea'];
-const STATUS_EMOJI: Record<TowerMissionStatus, string> = {
-  planned: '🟡',
-  active: '🔵',
-  completed: '🟢',
-  blocked: '🔴',
-  paused: '⏸️',
-  merged: '✅',
-  abandoned: '🚫',
-};
-
-function isOpenMission(mission: Pick<TowerMission, 'status'>): boolean {
-  return mission.status !== 'merged' && mission.status !== 'abandoned';
-}
-
-export class TowerStore {
-  constructor(readonly repoRoot: string) {}
-
-  async isInitialized(): Promise<boolean> {
+  private async ensureLoaded(): Promise<void> {
+    if (this.loaded) return
     try {
-      await readFile(this.abs(STATE_FILE), 'utf8');
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  async init(sessionId?: string, base?: string): Promise<TowerInitResult> {
-    if (!(await isInsideRepo(this.repoRoot))) {
-      throw new TowerProtocolError(
-        'tower needs a git repository (the session working directory is not inside one)',
-      );
-    }
-    if (!(await hasAnyCommit(this.repoRoot))) {
-      throw new TowerProtocolError(
-        'the repository has no commits yet — create an initial commit first',
-      );
-    }
-    // dsh-tower divergence from Kimi (#3346): never init / open on a dirty base.
-    if (await isWorktreeDirty(this.repoRoot)) {
-      throw new TowerProtocolError(
-        'tower refuses to init on a dirty working tree — commit or stash changes first (dsh-tower will not silently use HEAD while WIP exists)',
-      );
-    }
-    if (await this.isInitialized()) {
-      const state = await this.load();
-      const retiredAgents = await this.adoptForeignRoster(state, sessionId);
-      return {
-        base: state.base,
-        created: false,
-        retiredAgents,
-        checkout: await this.checkedOutBranch(),
-        ignoredBase: base !== undefined && base !== state.base ? base : undefined,
-        openMissions: state.missions.filter(isOpenMission).map((m) => m.id),
-      };
-    }
-
-    const checkout = await this.checkedOutBranch();
-    if (checkout === 'HEAD') {
-      throw new TowerProtocolError(
-        'cannot determine the base branch from a detached HEAD — check out a branch first',
-      );
-    }
-    // P3: arbitrary base branch (#3193). First release only allows current HEAD.
-    if (base !== undefined && base !== checkout) {
-      throw new TowerProtocolError(
-        `specifying a base branch other than the current HEAD is not supported yet (requested "${base}", checkout is "${checkout}")`,
-      );
-    }
-    const resolvedBase = checkout;
-
-    for (const dir of [INBOX_DIR, FINDINGS_DIR, REVIEWS_DIR, MISSIONS_DIR, LOG_DIR, WORKTREES_DIR]) {
-      await mkdir(this.abs(dir), { recursive: true });
-    }
-    await this.ensureGitExclude();
-
-    const state: TowerState = {
-      version: 1,
-      base: resolvedBase,
-      mode: 'branch',
-      createdAt: new Date().toISOString(),
-      sessionId,
-      roster: { agents: [] },
-      missions: [],
-    };
-    await this.save(state);
-    await writeFile(this.abs(ACTIVITY_LOG), '', 'utf8');
-    await this.renderMissionsIndex(state);
-    await this.appendLog(TOWER_NAME, 'init', { mode: state.mode, base: resolvedBase }, MISSIONS_INDEX);
-    return { base: resolvedBase, created: true, retiredAgents: [], checkout, openMissions: [] };
-  }
-
-  private async checkedOutBranch(): Promise<string> {
-    return (await tryGit(this.repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD'])) ?? 'HEAD';
-  }
-
-  private async adoptForeignRoster(
-    state: TowerState,
-    sessionId: string | undefined,
-  ): Promise<readonly string[]> {
-    if (sessionId === undefined || state.sessionId === sessionId) return [];
-    const previous = state.sessionId;
-    const stale = state.roster.agents.filter((agent) => agent.sessionId !== sessionId);
-    state.roster.agents.splice(
-      0,
-      state.roster.agents.length,
-      ...state.roster.agents.filter((agent) => agent.sessionId === sessionId),
-    );
-    state.sessionId = sessionId;
-    await this.save(state);
-    await this.appendLog(TOWER_NAME, 'adopt', {
-      session: sessionId,
-      previous: previous ?? 'unknown',
-      retired: stale.length > 0 ? stale.map((agent) => agent.name).join(',') : undefined,
-    });
-    return stale.map((agent) => agent.name);
-  }
-
-  private async ensureGitExclude(): Promise<void> {
-    const gitDir = (await readGitDir(this.repoRoot)) ?? join(this.repoRoot, '.git');
-    const excludePath = join(gitDir, 'info', 'exclude');
-    await mkdir(dirname(excludePath), { recursive: true });
-    let existing = '';
-    try {
-      existing = await readFile(excludePath, 'utf8');
-    } catch {
-    }
-    if (existing.split(/\r?\n/).some((line) => line.trim() === '.dsh-tower/')) return;
-    await appendFile(excludePath, `${existing.endsWith('\n') || existing.length === 0 ? '' : '\n'}.dsh-tower/\n`, 'utf8');
-  }
-
-  async load(): Promise<TowerState> {
-    let raw: string;
-    try {
-      raw = await readFile(this.abs(STATE_FILE), 'utf8');
-    } catch {
-      throw new TowerProtocolError(
-        'tower is not initialized in this repository — run TowerInit first',
-      );
-    }
-    const state = JSON.parse(raw) as TowerState;
-    for (const mission of state.missions) {
-      mission.kind ??= 'build';
-    }
-    return state;
-  }
-
-  private async save(state: TowerState): Promise<void> {
-    const file = this.abs(STATE_FILE);
-    const tmp = `${file}.tmp`;
-    await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
-    await rename(tmp, file);
-  }
-
-  async appendLog(
-    actor: string,
-    action: string,
-    details: Readonly<Record<string, string | number | undefined>> = {},
-    ref?: string,
-  ): Promise<void> {
-    const kv = Object.entries(details)
-      .filter((entry): entry is [string, string | number] => entry[1] !== undefined)
-      .map(([key, value]) => `${key}=${value}`)
-      .join(' ');
-    const parts = [new Date().toISOString(), actor, action];
-    if (kv.length > 0) parts.push(kv);
-    if (ref !== undefined) parts.push(`ref=${ref}`);
-    await appendFile(this.abs(ACTIVITY_LOG), `${parts.join(' ')}\n`, 'utf8');
-  }
-
-  async recentLog(lines: number): Promise<readonly string[]> {
-    let content = '';
-    try {
-      content = await readFile(this.abs(ACTIVITY_LOG), 'utf8');
-    } catch {
-      return [];
-    }
-    const all = content.split('\n').filter((line) => line.trim().length > 0);
-    return all.slice(-lines);
-  }
-
-  resolveCallerName(state: TowerState, agentId: string): string {
-    if (agentId === 'main') return TOWER_NAME;
-    const entry = state.roster.agents.find((agent) => agent.agentId === agentId);
-    if (entry === undefined) {
-      throw new TowerProtocolError(
-        `agent "${agentId}" is not a tower participant — only spawned workers/reviewers and the tower can use tower tools`,
-      );
-    }
-    return entry.name;
-  }
-
-  findAgent(state: TowerState, name: string): TowerRosterEntry | undefined {
-    return state.roster.agents.find((agent) => agent.name === name);
-  }
-
-  findByName(state: TowerState, name: string): TowerRosterEntry | undefined {
-    return this.findAgent(state, name);
-  }
-
-  async registerAgent(entry: TowerRosterEntry): Promise<void> {
-    const state = await this.load();
-    if (this.findAgent(state, entry.name) !== undefined) {
-      throw new TowerProtocolError(`tower agent name "${entry.name}" is already registered`);
-    }
-    state.roster.agents.push(entry);
-    await this.save(state);
-  }
-
-  async plan(input: readonly TowerPlanInput[]): Promise<readonly TowerMission[]> {
-    if (input.length === 0) {
-      throw new TowerProtocolError('TowerPlan needs at least one mission');
-    }
-    const state = await this.load();
-    const startIndex = state.missions.length;
-
-    const missions: TowerMission[] = input.map((item, index) => {
-      const n = startIndex + index + 1;
-      const slug = slugify(item.title, 40);
-      return {
-        id: `M${n}`,
-        title: item.title,
-        slug,
-        kind: item.kind ?? 'build',
-        scope: [...item.scope],
-        branch: `feat/${slug}`,
-        worktree: `wt-${n}`,
-        deps: item.deps ?? [],
-        status: 'planned',
-        tasks: (item.tasks ?? []).map((text) => ({ text, done: false })),
-        notes: [],
-        blockers: [],
-      };
-    });
-
-    const knownIds = new Set([...state.missions.map((m) => m.id), ...missions.map((m) => m.id)]);
-    for (const mission of missions) {
-      for (const dep of mission.deps) {
-        if (!knownIds.has(dep)) {
-          throw new TowerProtocolError(`mission ${mission.id} depends on unknown mission "${dep}"`);
-        }
+      const raw = await readFile(this.filePath, 'utf8')
+      const parsed = JSON.parse(raw) as EnvelopeV1
+      if (parsed.schemaVersion !== SCHEMA_VERSION) {
+        throw new Error(`unsupported schemaVersion: ${String(parsed.schemaVersion)}`)
+      }
+      this.envelope = {
+        schemaVersion: SCHEMA_VERSION,
+        missions: parsed.missions ?? {},
+        messages: parsed.messages ?? {},
+        events: parsed.events ?? [],
+      }
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code === 'ENOENT') {
+        this.envelope = emptyEnvelope()
+        await atomicWriteJson(this.filePath, this.envelope)
+      } else {
+        throw err
       }
     }
-    this.assertScopesDisjoint([
-      ...state.missions.filter(isOpenMission),
-      ...missions,
-    ]);
-
-    state.missions.push(...missions);
-    await this.save(state);
-    await this.renderMissionsIndex(state);
-    for (const mission of missions) {
-      await this.renderMissionFile(mission);
-    }
-    await this.appendLog(
-      TOWER_NAME,
-      'plan',
-      { missions: missions.map((m) => m.id).join(',') },
-      MISSIONS_INDEX,
-    );
-    return missions;
+    this.loaded = true
   }
 
-  private assertScopesDisjoint(missions: readonly TowerMission[]): void {
-    const scopes: Array<{ readonly id: string; readonly raw: string; readonly stem: string }> = [];
-    for (const mission of missions) {
-      if (mission.kind === 'survey') continue;
-      for (const raw of mission.scope) {
-        const stem = raw.replace(/\/\*\*?$/, '').replace(/\*$/, '').replace(/\/+$/, '');
-        if (stem.length === 0) {
-          throw new TowerProtocolError(
-            `mission ${mission.id} scope "${raw}" covers the whole repo — narrow it down`,
-          );
-        }
-        scopes.push({ id: mission.id, raw, stem });
-      }
-    }
-    for (let i = 0; i < scopes.length; i++) {
-      for (let j = i + 1; j < scopes.length; j++) {
-        const a = scopes[i]!;
-        const b = scopes[j]!;
-        if (a.id === b.id) continue;
-        if (a.stem === b.stem || a.stem.startsWith(`${b.stem}/`) || b.stem.startsWith(`${a.stem}/`)) {
-          throw new TowerProtocolError(
-            `mission scopes overlap: ${a.id} ("${a.raw}") vs ${b.id} ("${b.raw}") — split the shared files into exactly one mission; if one of them is stale finished work, abandon it first (TowerMission status=abandoned)`,
-          );
-        }
-      }
-    }
+  private enqueueWrite<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.writeChain.then(fn, fn)
+    this.writeChain = run.then(
+      () => undefined,
+      () => undefined,
+    )
+    return run
   }
 
-  async updateMission(
-    callerName: string,
-    id: string,
-    patch: TowerMissionPatch,
-    options: { readonly silent?: boolean } = {},
-  ): Promise<TowerMission> {
-    const state = await this.load();
-    const mission = state.missions.find((m) => m.id === id);
-    if (mission === undefined) {
-      throw new TowerProtocolError(`unknown mission "${id}"`);
-    }
-    if (callerName !== TOWER_NAME) {
-      const caller = this.findAgent(state, callerName);
-      if (caller?.kind !== 'worker' || caller.missionId !== id) {
-        throw new TowerProtocolError(
-          `agent "${callerName}" does not own mission ${id} — workers update only their own mission file`,
-        );
-      }
-    }
+  private async persist(): Promise<void> {
+    await atomicWriteJson(this.filePath, this.envelope)
+  }
 
-    const isNoOp =
-      patch.status === mission.status &&
-      patch.note === undefined &&
-      patch.blocker === undefined &&
-      patch.clearBlockers === undefined &&
-      patch.taskDone === undefined &&
-      patch.owner === undefined &&
-      patch.scope === undefined;
-    if (isNoOp) return mission;
+  private pushEvent(type: ProtocolEvent['type'], missionId: string, detail?: Record<string, unknown>): void {
+    this.envelope.events.push({
+      type,
+      at: nowIso(),
+      mission_id: missionId,
+      detail,
+    })
+  }
 
-    if (patch.owner !== undefined) {
-      if (callerName !== TOWER_NAME) {
-        throw new TowerProtocolError(
-          `agent "${callerName}" cannot assign mission ownership — only the tower sets owner`,
-        );
-      }
-      mission.owner = patch.owner;
-    }
-    if (patch.scope !== undefined) {
-      if (callerName !== TOWER_NAME) {
-        throw new TowerProtocolError(
-          `agent "${callerName}" cannot change mission scope — only the tower widens a scope, and every change is logged`,
-        );
-      }
-      this.assertScopesDisjoint([
-        ...state.missions.filter((m) => m.id !== id && isOpenMission(m)),
-        { ...mission, scope: [...patch.scope] },
-      ]);
-      mission.scope = [...patch.scope];
-    }
-    if (patch.status !== undefined) {
-      if (patch.status === 'abandoned' && callerName !== TOWER_NAME) {
-        throw new TowerProtocolError(
-          `agent "${callerName}" cannot abandon mission ${id} — abandoning releases the mission scope, so only the tower does it`,
-        );
-      }
-      mission.status = patch.status;
-    }
-    if (patch.note !== undefined) mission.notes.push(patch.note);
-    if (patch.blocker !== undefined) {
-      mission.blockers.push(patch.blocker);
-      mission.status = 'blocked';
-    }
-    if (patch.clearBlockers === true) mission.blockers = [];
-    if (patch.taskDone !== undefined) {
-      const task = mission.tasks.find((t) => !t.done && t.text.includes(patch.taskDone!));
-      if (task === undefined) {
-        throw new TowerProtocolError(
-          `mission ${id} has no open task matching "${patch.taskDone}"`,
-        );
-      }
-      task.done = true;
-    }
-
-    await this.save(state);
-    await this.renderMissionsIndex(state);
-    await this.renderMissionFile(mission);
-    const taskTickOnly =
-      patch.taskDone !== undefined &&
-      patch.status === undefined &&
-      patch.note === undefined &&
-      patch.blocker === undefined &&
-      patch.clearBlockers === undefined &&
-      patch.owner === undefined &&
-      patch.scope === undefined;
-    if (!taskTickOnly && options.silent !== true) {
-      await this.appendLog(callerName, 'mission.update', {
+  async createMission(input: {
+    title: string
+    goal: string
+    created_by: Role
+    metadata?: Record<string, unknown>
+  }): Promise<Mission> {
+    return this.enqueueWrite(async () => {
+      await this.ensureLoaded()
+      assertNonEmpty(input.title, 'title')
+      assertNonEmpty(input.goal, 'goal')
+      assertRole(input.created_by)
+      const id = randomUUID()
+      const ts = nowIso()
+      const mission: Mission = {
         id,
-        status: patch.status,
-        note: patch.note !== undefined ? 'added' : undefined,
-        blocker: patch.blocker !== undefined ? 'added' : undefined,
-        owner: patch.owner,
-        scope: patch.scope?.join(','),
-      });
-    }
-    return mission;
+        title: input.title.trim(),
+        goal: input.goal.trim(),
+        status: 'open',
+        created_by: input.created_by,
+        created_at: ts,
+        updated_at: ts,
+        metadata: input.metadata ? cloneDeep(input.metadata) : undefined,
+      }
+      this.envelope.missions[id] = mission
+      this.envelope.messages[id] = []
+      this.pushEvent('mission_created', id, { title: mission.title, created_by: mission.created_by })
+      await this.persist()
+      return cloneDeep(mission)
+    })
   }
 
-  async send(callerName: string, input: TowerSendInput): Promise<string> {
-    const state = await this.load();
-    const to = input.to.trim();
-    if (
-      to !== TOWER_NAME &&
-      to !== BROADCAST_NAME &&
-      this.findAgent(state, to) === undefined
-    ) {
-      const known = [TOWER_NAME, BROADCAST_NAME, ...state.roster.agents.map((a) => a.name)];
-      throw new TowerProtocolError(
-        `unknown recipient "${to}" — address a roster agent, ${TOWER_NAME}, or ${BROADCAST_NAME} (known: ${known.join(', ')})`,
-      );
-    }
-    if (to === callerName) {
-      throw new TowerProtocolError('cannot send an inbox message to yourself');
-    }
+  async getMission(id: string): Promise<Mission | undefined> {
+    await this.ensureLoaded()
+    const m = this.envelope.missions[id]
+    return m ? cloneDeep(m) : undefined
+  }
 
-    const frontmatter = renderFrontmatter({
-      type: 'inbox',
-      message_id: randomUUID(),
-      from: callerName,
-      to,
-      subject: input.subject,
-      sent_at: new Date().toISOString(),
-      ...(input.scope !== undefined ? { scope: input.scope } : {}),
-      ...(input.action !== undefined ? { action: input.action } : {}),
-      ...(input.consentRef !== undefined ? { consent_ref: input.consentRef } : {}),
+  async listMissions(): Promise<Mission[]> {
+    await this.ensureLoaded()
+    return Object.values(this.envelope.missions)
+      .map(cloneDeep)
+      .sort((a, b) => a.created_at.localeCompare(b.created_at))
+  }
+
+  async updateMissionStatus(id: string, status: MissionStatus): Promise<Mission> {
+    return this.enqueueWrite(async () => {
+      await this.ensureLoaded()
+      assertMissionStatus(status)
+      const mission = this.envelope.missions[id]
+      if (!mission) throw new Error(`mission not found: ${id}`)
+      mission.status = status
+      mission.updated_at = nowIso()
+      this.pushEvent('mission_status', id, { status })
+      await this.persist()
+      return cloneDeep(mission)
+    })
+  }
+
+  async send(input: {
+    mission_id: string
+    from: Role
+    to: Role
+    body: string
+    artifacts?: ArtifactRef[]
+    consent_ref?: ConsentRef
+  }): Promise<Message> {
+    return this.enqueueWrite(async () => {
+      await this.ensureLoaded()
+      assertRole(input.from)
+      assertRole(input.to)
+      assertNonEmpty(input.body, 'body')
+      if (input.from === input.to) throw new Error('from and to must differ')
+      const mission = this.envelope.missions[input.mission_id]
+      if (!mission) throw new Error(`mission not found: ${input.mission_id}`)
+      if (mission.status === 'cancelled' || mission.status === 'done') {
+        throw new Error(`mission is ${mission.status}; cannot send`)
+      }
+      const artifacts = (input.artifacts ?? []).map((a) => {
+        assertArtifact(a)
+        return cloneDeep(a)
+      })
+      let consent_ref: ConsentRef | undefined
+      if (input.consent_ref) {
+        assertConsent(input.consent_ref)
+        consent_ref = cloneDeep(input.consent_ref)
+      }
+      const msg: Message = {
+        id: randomUUID(),
+        mission_id: input.mission_id,
+        from: input.from,
+        to: input.to,
+        body: input.body,
+        created_at: nowIso(),
+        artifacts: artifacts.length ? artifacts : undefined,
+        consent_ref,
+      }
+      const list = this.envelope.messages[input.mission_id] ?? []
+      list.push(msg)
+      this.envelope.messages[input.mission_id] = list
+      mission.updated_at = msg.created_at
+      this.pushEvent('message_sent', input.mission_id, {
+        message_id: msg.id,
+        from: msg.from,
+        to: msg.to,
+        artifact_count: artifacts.length,
+        has_consent: Boolean(consent_ref),
+      })
+      await this.persist()
+      return cloneDeep(msg)
+    })
+  }
+
+  async listMessages(missionId: string): Promise<Message[]> {
+    await this.ensureLoaded()
+    const list = this.envelope.messages[missionId] ?? []
+    return list.map(cloneDeep)
+  }
+
+  async addArtifactFile(input: {
+    mission_id: string
+    from: Role
+    to: Role
+    filePath: string
+    media_type: string
+    body?: string
+    consent_ref?: ConsentRef
+  }): Promise<{ message: Message; artifact: ArtifactRef }> {
+    return this.enqueueWrite(async () => {
+      await this.ensureLoaded()
+      const mission = this.envelope.missions[input.mission_id]
+      if (!mission) throw new Error(`mission not found: ${input.mission_id}`)
+      const abs = path.resolve(input.filePath)
+      const bytesBuf = await readFile(abs)
+      const sha256 = createHash('sha256').update(bytesBuf).digest('hex')
+      const destDir = path.join(this.defaultArtifactsRoot, input.mission_id)
+      await mkdir(destDir, { recursive: true })
+      const base = path.basename(abs)
+      const dest = path.join(destDir, `${sha256.slice(0, 12)}-${base}`)
+      await writeFile(dest, bytesBuf)
+      const artifact: ArtifactRef = {
+        uri: dest,
+        media_type: input.media_type,
+        sha256,
+        bytes: bytesBuf.byteLength,
+      }
+      const msg = await this.sendUnlocked({
+        mission_id: input.mission_id,
+        from: input.from,
+        to: input.to,
+        body: input.body ?? `artifact:${base}`,
+        artifacts: [artifact],
+        consent_ref: input.consent_ref,
+      })
+      this.pushEvent('artifact_added', input.mission_id, {
+        message_id: msg.id,
+        uri: artifact.uri,
+        sha256: artifact.sha256,
+        bytes: artifact.bytes,
+      })
+      await this.persist()
+      return { message: cloneDeep(msg), artifact: cloneDeep(artifact) }
+    })
+  }
+
+  /** Internal send used while already holding the write lock. */
+  private async sendUnlocked(input: {
+    mission_id: string
+    from: Role
+    to: Role
+    body: string
+    artifacts?: ArtifactRef[]
+    consent_ref?: ConsentRef
+  }): Promise<Message> {
+    assertRole(input.from)
+    assertRole(input.to)
+    assertNonEmpty(input.body, 'body')
+    if (input.from === input.to) throw new Error('from and to must differ')
+    const mission = this.envelope.missions[input.mission_id]
+    if (!mission) throw new Error(`mission not found: ${input.mission_id}`)
+    if (mission.status === 'cancelled' || mission.status === 'done') {
+      throw new Error(`mission is ${mission.status}; cannot send`)
+    }
+    const artifacts = (input.artifacts ?? []).map((a) => {
+      assertArtifact(a)
+      return cloneDeep(a)
+    })
+    let consent_ref: ConsentRef | undefined
+    if (input.consent_ref) {
+      assertConsent(input.consent_ref)
+      consent_ref = cloneDeep(input.consent_ref)
+    }
+    const msg: Message = {
+      id: randomUUID(),
+      mission_id: input.mission_id,
+      from: input.from,
+      to: input.to,
+      body: input.body,
+      created_at: nowIso(),
+      artifacts: artifacts.length ? artifacts : undefined,
+      consent_ref,
+    }
+    const list = this.envelope.messages[input.mission_id] ?? []
+    list.push(msg)
+    this.envelope.messages[input.mission_id] = list
+    mission.updated_at = msg.created_at
+    this.pushEvent('message_sent', input.mission_id, {
+      message_id: msg.id,
+      from: msg.from,
+      to: msg.to,
+      artifact_count: artifacts.length,
+      has_consent: Boolean(consent_ref),
+    })
+    return msg
+  }
+
+  async listEvents(missionId?: string): Promise<ProtocolEvent[]> {
+    await this.ensureLoaded()
+    const events = missionId
+      ? this.envelope.events.filter((e) => e.mission_id === missionId)
+      : this.envelope.events
+    return events.map(cloneDeep)
+  }
+
+  async exportMarkdown(missionId: string): Promise<string> {
+    await this.ensureLoaded()
+    const mission = this.envelope.missions[missionId]
+    if (!mission) throw new Error(`mission not found: ${missionId}`)
+    const messages = this.envelope.messages[missionId] ?? []
+    const lines: string[] = [
+      `# Mission: ${mission.title}`,
+      '',
+      `- id: \`${mission.id}\``,
+      `- status: \`${mission.status}\``,
+      `- goal: ${mission.goal}`,
+      `- created_by: ${mission.created_by}`,
+      `- created_at: ${mission.created_at}`,
+      `- updated_at: ${mission.updated_at}`,
+      '',
+      '## Messages',
+      '',
+    ]
+    for (const m of messages) {
+      lines.push(`### ${m.created_at} — ${m.from} → ${m.to}`)
+      lines.push('')
+      lines.push(m.body)
+      lines.push('')
+      if (m.artifacts?.length) {
+        lines.push('Artifacts:')
+        for (const a of m.artifacts) {
+          lines.push(`- \`${a.uri}\` (${a.media_type}, ${a.bytes} bytes, sha256=${a.sha256})`)
+        }
+        lines.push('')
+      }
+      if (m.consent_ref) {
+        lines.push(
+          `Consent: id=${m.consent_ref.id} status=${m.consent_ref.status} scope=${m.consent_ref.scope}`,
+        )
+        lines.push('')
+      }
+    }
+    return `${lines.join('\n')}\n`
+  }
+}
+
+export function createProtocolStore(config: ProtocolConfig): ProtocolStore {
+  return new FileProtocolStore(config)
+}
