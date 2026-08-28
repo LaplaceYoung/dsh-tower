@@ -1,0 +1,8 @@
+node_modules/
+lib/
+dist/
+coverage/
+*.log
+.DS_Store
+.tmp/
+.dsh-tower/

@@ -1,0 +1,8 @@
+# dsh-tower bundle patch: host plugin (11 Tower* tools + /tower + write guard).
+# Tools register only when experimental=true or DSH_EXPERIMENTAL_TOWER=1.
+- insert:
+    - id: dsh-tower
+      name: dsh-tower
+      config:
+        experimental: false
+        inflightCap: 8
