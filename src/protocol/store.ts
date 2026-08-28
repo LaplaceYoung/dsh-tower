@@ -382,3 +382,111 @@ export class TowerStore {
       for (const raw of mission.scope) {
         const stem = raw.replace(/\/\*\*?$/, '').replace(/\*$/, '').replace(/\/+$/, '');
         if (stem.length === 0) {
+          throw new TowerProtocolError(
+            `mission ${mission.id} scope "${raw}" covers the whole repo — narrow it down`,
+          );
+        }
+        scopes.push({ id: mission.id, raw, stem });
+      }
+    }
+    for (let i = 0; i < scopes.length; i++) {
+      for (let j = i + 1; j < scopes.length; j++) {
+        const a = scopes[i]!;
+        const b = scopes[j]!;
+        if (a.id === b.id) continue;
+        if (a.stem === b.stem || a.stem.startsWith(`${b.stem}/`) || b.stem.startsWith(`${a.stem}/`)) {
+          throw new TowerProtocolError(
+            `mission scopes overlap: ${a.id} ("${a.raw}") vs ${b.id} ("${b.raw}") — split the shared files into exactly one mission; if one of them is stale finished work, abandon it first (TowerMission status=abandoned)`,
+          );
+        }
+      }
+    }
+  }
+
+  async updateMission(
+    callerName: string,
+    id: string,
+    patch: TowerMissionPatch,
+    options: { readonly silent?: boolean } = {},
+  ): Promise<TowerMission> {
+    const state = await this.load();
+    const mission = state.missions.find((m) => m.id === id);
+    if (mission === undefined) {
+      throw new TowerProtocolError(`unknown mission "${id}"`);
+    }
+    if (callerName !== TOWER_NAME) {
+      const caller = this.findAgent(state, callerName);
+      if (caller?.kind !== 'worker' || caller.missionId !== id) {
+        throw new TowerProtocolError(
+          `agent "${callerName}" does not own mission ${id} — workers update only their own mission file`,
+        );
+      }
+    }
+
+    const isNoOp =
+      patch.status === mission.status &&
+      patch.note === undefined &&
+      patch.blocker === undefined &&
+      patch.clearBlockers === undefined &&
+      patch.taskDone === undefined &&
+      patch.owner === undefined &&
+      patch.scope === undefined;
+    if (isNoOp) return mission;
+
+    if (patch.owner !== undefined) {
+      if (callerName !== TOWER_NAME) {
+        throw new TowerProtocolError(
+          `agent "${callerName}" cannot assign mission ownership — only the tower sets owner`,
+        );
+      }
+      mission.owner = patch.owner;
+    }
+    if (patch.scope !== undefined) {
+      if (callerName !== TOWER_NAME) {
+        throw new TowerProtocolError(
+          `agent "${callerName}" cannot change mission scope — only the tower widens a scope, and every change is logged`,
+        );
+      }
+      this.assertScopesDisjoint([
+        ...state.missions.filter((m) => m.id !== id && isOpenMission(m)),
+        { ...mission, scope: [...patch.scope] },
+      ]);
+      mission.scope = [...patch.scope];
+    }
+    if (patch.status !== undefined) {
+      if (patch.status === 'abandoned' && callerName !== TOWER_NAME) {
+        throw new TowerProtocolError(
+          `agent "${callerName}" cannot abandon mission ${id} — abandoning releases the mission scope, so only the tower does it`,
+        );
+      }
+      mission.status = patch.status;
+    }
+    if (patch.note !== undefined) mission.notes.push(patch.note);
+    if (patch.blocker !== undefined) {
+      mission.blockers.push(patch.blocker);
+      mission.status = 'blocked';
+    }
+    if (patch.clearBlockers === true) mission.blockers = [];
+    if (patch.taskDone !== undefined) {
+      const task = mission.tasks.find((t) => !t.done && t.text.includes(patch.taskDone!));
+      if (task === undefined) {
+        throw new TowerProtocolError(
+          `mission ${id} has no open task matching "${patch.taskDone}"`,
+        );
+      }
+      task.done = true;
+    }
+
+    await this.save(state);
+    await this.renderMissionsIndex(state);
+    await this.renderMissionFile(mission);
+    const taskTickOnly =
+      patch.taskDone !== undefined &&
+      patch.status === undefined &&
+      patch.note === undefined &&
+      patch.blocker === undefined &&
+      patch.clearBlockers === undefined &&
+      patch.owner === undefined &&
+      patch.scope === undefined;
+    if (!taskTickOnly && options.silent !== true) {
+      await this.appendLog(callerName, 'mission.update', {
