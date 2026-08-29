@@ -1,0 +1,43 @@
+name: assemble-package-lock
+on:
+  push:
+    paths:
+      - '.lock-b64/**'
+      - '.github/workflows/assemble-package-lock.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble package-lock.json
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64, gzip, hashlib
+          root = Path('.lock-b64')
+          parts = []
+          for i in range(0, 8):
+              parts.append((root / f'{i:02d}.txt').read_text())
+          for i in range(8, 13):
+              micros = sorted(root.glob(f'{i:02d}_*.txt'))
+              assert micros, i
+              parts.append(''.join(p.read_text() for p in micros))
+          b64 = ''.join(parts)
+          lock = gzip.decompress(base64.b64decode(b64))
+          h = hashlib.sha256(lock).hexdigest()
+          assert h == 'ebde85cb1a3d8b32ef5d08e0f4e1cac6950181cc69078969d97ac9107024662c', h
+          Path('package-lock.json').write_bytes(lock)
+          print('ok', h, len(lock))
+          PY
+          rm -rf .lock-b64
+          rm -f .github/workflows/assemble-package-lock.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git status
+          git commit -m "feat: Cordis-nativize Tower host with ctx.tower service"
+          git push
