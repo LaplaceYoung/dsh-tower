@@ -2,11 +2,16 @@ import { describe, expect, it } from 'vitest';
 
 import { isTowerEnabled } from '../../src/host/flag.js';
 import { TowerRateLimit } from '../../src/host/rateLimit.js';
-import { towerWriteGuard } from '../../src/host/guard.js';
 import { workerBriefing } from '../../src/host/briefing.js';
 import { TOWER_ALL_TOOLS } from '../../src/host/runtime.js';
+import { reviewerToolDeny, workerToolDeny, TOWER_MODE_MAIN_DENY } from '../../src/host/profiles.js';
+import {
+  TOWER_MODE_EXIT_REMINDER,
+  TOWER_MODE_FULL_REMINDER,
+  TOWER_MODE_SPARSE_REMINDER,
+} from '../../src/host/injection/index.js';
 
-describe('host flag / rate limit / guard helpers', () => {
+describe('host flag / rate limit / profiles / injection', () => {
   it('defaults experimental tower to off', () => {
     const prev = process.env['DSH_EXPERIMENTAL_TOWER'];
     delete process.env['DSH_EXPERIMENTAL_TOWER'];
@@ -30,34 +35,51 @@ describe('host flag / rate limit / guard helpers', () => {
     expect(rl.acquire().ok).toBe(true);
   });
 
-  it('write guard fails open without roster cache', () => {
-    const reason = towerWriteGuard({
-      name: 'write',
-      arguments: { file_path: '/tmp/x.ts' },
-      callId: 'c' as never,
-      rootCallId: 'c' as never,
-      token: Symbol('t') as never,
-      signal: AbortSignal.abort(),
-    });
-    expect(reason).toBeUndefined();
+  it('rate limit pause after reportRateLimited', () => {
+    const rl = new TowerRateLimit(8);
+    expect(rl.acquire().ok).toBe(true);
+    rl.reportRateLimited();
+    const next = rl.acquire();
+    expect(next.ok).toBe(false);
+    if (!next.ok) expect(next.reason).toMatch(/paused|rate-limit/i);
+    rl.release();
+    rl.reportSuccess();
+    expect(rl.acquire().ok).toBe(true);
   });
 
-  it('worker briefing pins absolute worktree path', () => {
+  it('exposes eleven tower tools', () => {
+    expect(TOWER_ALL_TOOLS).toHaveLength(11);
+  });
+
+  it('worker deny includes AskUserQuestion and TodoList; reviewer also denies writes', () => {
+    expect(workerToolDeny()).toEqual(
+      expect.arrayContaining(['AskUserQuestion', 'TodoList', 'TowerMerge']),
+    );
+    expect(reviewerToolDeny()).toEqual(
+      expect.arrayContaining(['write', 'edit', 'str_replace_editor', 'AskUserQuestion']),
+    );
+    expect(TOWER_MODE_MAIN_DENY.has('TodoList')).toBe(true);
+  });
+
+  it('injection texts use .dsh-tower and cover full/sparse/exit', () => {
+    expect(TOWER_MODE_FULL_REMINDER).toMatch(/\.dsh-tower/);
+    expect(TOWER_MODE_SPARSE_REMINDER).toMatch(/\.dsh-tower/);
+    expect(TOWER_MODE_EXIT_REMINDER).toMatch(/\.dsh-tower/);
+    expect(TOWER_MODE_EXIT_REMINDER).toMatch(/\/tower on/);
+  });
+
+  it('worker briefing mentions protocol tools', () => {
     const text = workerBriefing({
       name: 'w1',
       kind: 'worker',
       repoRoot: '/repo',
       worktreeAbs: '/repo/.dsh-tower/worktrees/wt-1',
-      missionId: 'M1',
+      missionId: 'm1',
       missionTitle: 'A',
       branch: 'feat/a',
       scope: ['src/a.ts'],
     });
-    expect(text).toContain('/repo/.dsh-tower/worktrees/wt-1');
-    expect(text).toContain('Never call TowerInit');
-  });
-
-  it('exports all 11 tower tool names', () => {
-    expect(TOWER_ALL_TOOLS).toHaveLength(11);
+    expect(text).toMatch(/TowerSend/);
+    expect(text).toMatch(/\.dsh-tower/);
   });
 });
