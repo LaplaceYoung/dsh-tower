@@ -39,6 +39,13 @@ Evidence gathered in this agent run (2026-08-28).
 - [x] Dual-mission scripted merge: two disjoint scopes → clean reviews → both land on main → teardown removes worktrees
 - [x] Native seams wired: `systemPrompt.section`, `tools/pre-execute`, `subagent/end`
 - [x] `defineTool` nested object schemas include `additionalProperties` (DSH web requirement)
+- [x] Cordis-native `ctx.tower` Service (`enter` / `exit` / `isActive`, rate-limit, roster cache)
+- [x] Config via `@deepseek-ai/schemastery` (runtime dependency)
+- [x] Mode injection full / sparse / exit (`.dsh-tower` adapted)
+- [x] `/tower off` exits mode; TodoList denied while mode active
+- [x] Worker profile denies `AskUserQuestion` + `TodoList`
+- [x] Mount smoke proves `ctx.tower` + 11 tools + listeners (`scripts/verify-host-mount.mjs`)
+- [x] `npm test` → 26 green (protocol + host)
 
 ## Packaging
 

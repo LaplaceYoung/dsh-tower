@@ -13,22 +13,9 @@ import {
 } from '../protocol/index.js';
 import { workerBriefing } from './briefing.js';
 import { refreshRosterCache } from './guard.js';
-import type { TowerRateLimit } from './rateLimit.js';
+import { reviewerToolDeny, workerToolDeny } from './profiles.js';
 
 const SUBAGENT_PROVIDER = 'spawn';
-
-const MAIN_ONLY_DENY = [
-  'TowerInit',
-  'TowerPlan',
-  'TowerSpawn',
-  'TowerMerge',
-  'TowerTeardown',
-  'swarm_batch',
-  'TeamSpawn',
-  'TeamMessage',
-] as const;
-
-const REVIEWER_WRITE_DENY = ['write', 'edit', 'str_replace_editor'] as const;
 
 export interface SpawnArgs {
   readonly name: string;
@@ -42,11 +29,11 @@ export async function spawnTowerAgent(input: {
   readonly ctx: Context;
   readonly parent: Agent;
   readonly store: TowerStore;
-  readonly rateLimit: TowerRateLimit;
   readonly args: SpawnArgs;
   readonly signal?: AbortSignal;
 }): Promise<string> {
-  const { ctx, parent, store, rateLimit, args } = input;
+  const { ctx, parent, store, args } = input;
+  const rateLimit = ctx.tower.rateLimit;
   const state = await store.load();
 
   if (store.findByName(state, args.name) !== undefined) {
@@ -109,10 +96,7 @@ export async function spawnTowerAgent(input: {
       extra: args.instructions,
     });
 
-    const deny = [
-      ...MAIN_ONLY_DENY,
-      ...(args.kind === 'reviewer' ? REVIEWER_WRITE_DENY : []),
-    ];
+    const deny = args.kind === 'reviewer' ? reviewerToolDeny() : workerToolDeny();
 
     let started: ContinuableStart;
     try {
@@ -172,9 +156,15 @@ export async function spawnTowerAgent(input: {
       target: reviewTarget,
     });
 
-    await refreshRosterCache(store.repoRoot);
+    await refreshRosterCache(ctx, store.repoRoot);
     rateLimit.holdChild(agentId);
     slotHeld = false;
+
+    // Sparse reminder on parent when a child settles is handled at wake time;
+    // after spawn acceptance, refresh full coordination context once if mode active.
+    if (ctx.tower.isActive(String(parent.session.id))) {
+      void ctx.tower.inject(parent, 'sparse');
+    }
 
     return [
       `name: ${args.name}`,

@@ -6,7 +6,6 @@ import type { ToolRunContext } from '@deepseek-ai/dsh-tools';
 
 import { TOWER_NAME } from '../../protocol/index.js';
 import { refreshRosterCache } from '../guard.js';
-import type { TowerRateLimit } from '../rateLimit.js';
 import {
   TOWER_MAIN_AGENT_ONLY,
   protocolAgentId,
@@ -41,7 +40,7 @@ function requireMain(exec: ToolRunContext): void {
   }
 }
 
-export function registerTowerTools(ctx: Context, rateLimit: TowerRateLimit): void {
+export function registerTowerTools(ctx: Context): void {
   ctx.tools.register(
     textTool(
       'TowerInit',
@@ -51,10 +50,11 @@ export function registerTowerTools(ctx: Context, rateLimit: TowerRateLimit): voi
         runTower(async () => {
           requireMain(exec);
           const store = storeFromExec(exec);
-          const result = await store.init(
-            exec.agent !== undefined ? String(exec.agent.session.id) : undefined,
-          );
-          await refreshRosterCache(store.repoRoot);
+          const sessionId =
+            exec.agent !== undefined ? String(exec.agent.session.id) : undefined;
+          const result = await store.init(sessionId);
+          if (sessionId !== undefined) ctx.tower.enter(sessionId);
+          await refreshRosterCache(ctx, store.repoRoot);
           return [
             result.created
               ? 'tower workspace initialized'
@@ -155,7 +155,6 @@ export function registerTowerTools(ctx: Context, rateLimit: TowerRateLimit): voi
             ctx,
             parent: exec.agent,
             store,
-            rateLimit,
             args: {
               name: String(args['name']),
               kind,
@@ -368,6 +367,7 @@ export function registerTowerTools(ctx: Context, rateLimit: TowerRateLimit): voi
           // Presence check — any roster participant or main may call.
           store.resolveCallerName(state, protocolAgentId(exec.agent));
           const log = await store.recentLog(Number(args['log_lines'] ?? 20));
+          const rl = ctx.tower.rateLimit.snapshot();
           const missionRows = state.missions.map(
             (m) =>
               `| ${m.id} | ${m.title} | ${m.status} | ${m.owner ?? '—'} | ${m.branch} | ${m.worktree} |`,
@@ -378,6 +378,7 @@ export function registerTowerTools(ctx: Context, rateLimit: TowerRateLimit): voi
           return [
             `# Tower status`,
             `base: ${state.base}  session: ${state.sessionId ?? '—'}`,
+            `rate-limit: ${rl.inflight}/${rl.budget} (cap ${rl.cap})`,
             '',
             '## Missions',
             '| ID | Title | Status | Owner | Branch | Worktree |',
@@ -408,7 +409,8 @@ export function registerTowerTools(ctx: Context, rateLimit: TowerRateLimit): voi
           requireMain(exec);
           const store = storeFromExec(exec);
           const report = await store.teardown({ force: Boolean(args['force']) });
-          await refreshRosterCache(store.repoRoot);
+          if (exec.agent !== undefined) ctx.tower.exit(String(exec.agent.session.id));
+          ctx.tower.clearRosterCache(store.repoRoot);
           return ['teardown:', ...report.map((line) => `- ${line}`)].join('\n');
         }),
     ),
