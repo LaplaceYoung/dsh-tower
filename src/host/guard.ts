@@ -1,5 +1,6 @@
 import { join } from 'node:path';
 
+import type { Context } from '@deepseek-ai/cordis';
 import type { ToolExecution } from '@deepseek-ai/dsh-tools';
 
 import { TowerStore, WORKTREES_DIR, resolveTowerRepoRoot } from '../protocol/index.js';
@@ -26,24 +27,17 @@ function isPathInside(path: string, root: string): boolean {
   return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}/`);
 }
 
-interface RosterCache {
-  readonly repoRoot: string;
-  readonly agents: ReadonlyArray<{ readonly agentId: string; readonly worktree?: string }>;
-  readonly loadedAt: number;
-}
-
-const rosterCache = new Map<string, RosterCache>();
-
-/** Call after spawn/init/teardown and periodically from tools so the sync guard stays warm. */
-export async function refreshRosterCache(repoRoot: string): Promise<void> {
+/** Call after spawn/init/teardown so the sync guard stays warm. */
+export async function refreshRosterCache(ctx: Context, repoRoot: string): Promise<void> {
+  const tower = ctx.tower;
   try {
     const store = new TowerStore(repoRoot);
     if (!(await store.isInitialized())) {
-      rosterCache.delete(repoRoot);
+      tower.clearRosterCache(repoRoot);
       return;
     }
     const state = await store.load();
-    rosterCache.set(repoRoot, {
+    tower.setRosterCache({
       repoRoot,
       agents: state.roster.agents.map((a) => ({
         agentId: a.agentId,
@@ -57,39 +51,42 @@ export async function refreshRosterCache(repoRoot: string): Promise<void> {
 }
 
 /**
- * Sync monotonic guard (`ctx.tools.guard`). Uses a short-lived roster cache
- * refreshed by tower tool execute paths and the async pre-execute hook.
+ * Sync monotonic guard factory (`ctx.tools.guard`).
+ * Uses roster cache owned by `ctx.tower`.
  */
-export function towerWriteGuard(execution: Readonly<ToolExecution>): string | undefined {
-  if (!WRITE_TOOL_NAMES.has(execution.name)) return undefined;
-  const agent = execution.agent;
-  if (agent === undefined) return undefined;
-  const agentId = protocolAgentId(agent);
-  if (agentId === 'main') return undefined;
+export function towerWriteGuard(ctx: Context): (execution: Readonly<ToolExecution>) => string | undefined {
+  return (execution) => {
+    if (!WRITE_TOOL_NAMES.has(execution.name)) return undefined;
+    const agent = execution.agent;
+    if (agent === undefined) return undefined;
+    const agentId = protocolAgentId(agent);
+    if (agentId === 'main') return undefined;
 
-  const cwd = sessionCwd(agent);
-  const repoRoot = resolveTowerRepoRoot(cwd);
-  const cached = rosterCache.get(repoRoot);
-  if (cached === undefined) return undefined;
+    const cwd = sessionCwd(agent);
+    const repoRoot = resolveTowerRepoRoot(cwd);
+    const cached = ctx.tower.getRosterCache(repoRoot);
+    if (cached === undefined) return undefined;
 
-  const entry = cached.agents.find((a) => a.agentId === agentId);
-  if (entry?.worktree === undefined) return undefined;
+    const entry = cached.agents.find((a) => a.agentId === agentId);
+    if (entry?.worktree === undefined) return undefined;
 
-  const filePath = extractWritePath(execution.arguments);
-  if (filePath === undefined) return undefined;
+    const filePath = extractWritePath(execution.arguments);
+    if (filePath === undefined) return undefined;
 
-  const worktreeAbs = join(cached.repoRoot, WORKTREES_DIR, entry.worktree);
-  const target = absPath(cwd, filePath);
-  if (isPathInside(target, worktreeAbs)) return undefined;
+    const worktreeAbs = join(cached.repoRoot, WORKTREES_DIR, entry.worktree);
+    const target = absPath(cwd, filePath);
+    if (isPathInside(target, worktreeAbs)) return undefined;
 
-  return (
-    `tower workers may only write inside their own worktree (${worktreeAbs}) — denied: ${target}. ` +
-    'Out-of-scope changes are not yours to make: file them with TowerFinding or ask the tower via TowerSend.'
-  );
+    return (
+      `tower workers may only write inside their own worktree (${worktreeAbs}) — denied: ${target}. ` +
+      'Out-of-scope changes are not yours to make: file them with TowerFinding or ask the tower via TowerSend.'
+    );
+  };
 }
 
 /** Prefer this when wiring `tools/pre-execute` waterfall (async, authoritative). */
 export async function towerWritePreExecute(
+  ctx: Context,
   execution: Readonly<ToolExecution>,
 ): Promise<{ kind: 'deny'; reason: string } | undefined> {
   if (!WRITE_TOOL_NAMES.has(execution.name)) return undefined;
@@ -100,7 +97,7 @@ export async function towerWritePreExecute(
 
   const cwd = sessionCwd(agent);
   const repoRoot = resolveTowerRepoRoot(cwd);
-  await refreshRosterCache(repoRoot);
+  await refreshRosterCache(ctx, repoRoot);
 
   const filePath = extractWritePath(execution.arguments);
   if (filePath === undefined) return undefined;
