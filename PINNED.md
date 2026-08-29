@@ -34,6 +34,13 @@ Note: tag `@moonshot-ai/kimi-code@0.4.0` exists but is older (2026-05-27), not a
 | Commits on `origin/master` since tag touching `packages/subagent`, `packages/experimental/agent-team`, `docs/user/develop` | **none** |
 | Cordis at this tag | `@deepseek-ai/cordis@4.0.1` (`vendor/cordis`) |
 
+## Cordis / schemastery
+
+| Field | Value |
+|---|---|
+| Cordis | `@deepseek-ai/cordis@^4.0.1` |
+| Schemastery (runtime Config) | `@deepseek-ai/schemastery@^3.18.1` (DSH vendor pin `3.18.1`) |
+
 ## Deviation log
 
 - Spec text said `master` for kimi-code; remote default is `main`. Diffed against `origin/main`.
