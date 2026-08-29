@@ -1,7 +1,7 @@
 {
   "name": "dsh-tower",
   "version": "0.1.0",
-  "description": "DeepSeek Harness community plugin: Kimi Code Tower (isolated worktrees, review gate, merge gate) mounted via DSH plugin seams.",
+  "description": "DeepSeek Harness (dsh) plugin that ports Kimi Code Tower: isolated git worktrees, review gates, and merge gates.",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",
@@ -81,7 +81,8 @@
     "cordis.patch.yml",
     "PINNED.md",
     "README.md",
-    "README.zh.md"
+    "README.zh.md",
+    "LICENSE"
   ],
   "repository": {
     "type": "git",
@@ -90,9 +91,12 @@
   "keywords": [
     "deepseek-harness",
     "dsh",
+    "dsh-plugin",
     "tower",
     "kimi-code",
     "worktree",
-    "multi-agent"
+    "git-worktree",
+    "multi-agent",
+    "coding-agent"
   ]
 }
